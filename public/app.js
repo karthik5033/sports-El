@@ -204,13 +204,23 @@ async function toggleCamera(forceState) {
   
   if (targetState) {
     try {
-      // Ask user for browser camera permission
-      browserStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      // Ask user for browser camera permission with a timeout for headless environments
+      const streamPromise = navigator.mediaDevices.getUserMedia({ video: true });
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Timeout")), 3000)
+      );
       
-      // Stop the browser stream track immediately to save resources,
-      // as backend OpenCV is doing the actual capturing.
-      browserStream.getTracks().forEach(track => track.stop());
-      browserStream = null;
+      browserStream = await Promise.race([streamPromise, timeoutPromise]).catch(err => {
+        console.warn("Camera check bypassed/timed out, continuing to backend:", err.message);
+        return null;
+      });
+      
+      if (browserStream) {
+        // Stop the browser stream track immediately to save resources,
+        // as backend OpenCV is doing the actual capturing.
+        browserStream.getTracks().forEach(track => track.stop());
+        browserStream = null;
+      }
       
       cameraEnabled = true;
       updateCameraUI(true);
@@ -605,7 +615,10 @@ function buildSetDots(total, active) {
 }
 
 function resetPhase() {
-  ['ph-down','ph-up','ph-down2'].forEach(id => $(id).classList.remove('active'));
+  ['ph-down','ph-up'].forEach(id => {
+    const el = $(id);
+    if(el) el.classList.remove('active');
+  });
 }
 
 function updatePhase(state) {
