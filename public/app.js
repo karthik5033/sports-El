@@ -1,16 +1,29 @@
 /* ── app.js — PhysioAI frontend logic ──────────────────────── */
 const socket = io();
 
-// ── State ──────────────────────────────────────────────────────
+// ── Settings & State ───────────────────────────────────────────
+let settings = JSON.parse(localStorage.getItem('physioai_settings')) || {
+  restDuration: 30,
+  volume: 70,
+  metronome: false,
+  mirror: true
+};
+
 let cfg = { mode: 'SQUATS', reps: 10, sets: 3 };
 let sessionState = 'setup';   // 'setup' | 'running' | 'complete'
 let currentSet   = 1;
 let lastRepCount = 0;
+let lastCorrectCount = 0;
+let lastIncorrectCount = 0;
 let lastSetCompleteTime = 0;  // debounce: ignore duplicate session_complete events
 let cameraEnabled = false;
 let browserStream = null;
 let voiceEnabled = true; // Voice guidance enabled by default
 let lastSpokenFeedback = '';
+
+// Session error logger for complete screen insights
+let sessionErrors = new Set();
+let metronomeIntervalId = null;
 
 // ── DOM refs ───────────────────────────────────────────────────
 const screens = {
@@ -47,7 +60,6 @@ const restCountdown = $('rest-countdown');
 const restBarFill   = $('rest-bar-fill');
 const restPrevStats = $('rest-prev-stats');
 
-const REST_DURATION = 30; // seconds between sets
 let   restTimerId   = null; // holds setInterval handle
 
 const TIPS = {
@@ -64,18 +76,385 @@ const ICONS = {
   default:'🎯',
 };
 
-// ── Screen helpers ─────────────────────────────────────────────
+const INSIGHTS_MAP = {
+  // Squats
+  "Straighten Your Back": "Ensure your spine remains neutral. Keep your chest proud and avoid bending forward from the waist.",
+  "Keep Heels Grounded": "Your heels lifted during the squat. Press weight into your heels to maintain balance and engagement.",
+  "Balance Your Weight Evenly": "We noticed side-to-side asymmetry. Try distributing your weight equally on both legs.",
+  "Push Knees Outward": "Knees collapsed inward. Actively press your knees outward so they track in line with your toes.",
+  "Go Lower": "Your squat depth was slightly shallow. Try to lower your hips until your thighs are parallel to the floor.",
+  
+  // Sit to Stand
+  "Reduce forward bending": "Focus on standing tall using your leg strength rather than swinging your torso forward for momentum.",
+  "Stand fully upright": "Make sure you extend your knees fully at the very top of each stand.",
+  "Extend hips properly": "Squeeze your glutes at the top to achieve complete hip extension.",
+  
+  // Lunges
+  "Keep your torso upright": "Keep your head and chest up throughout the lunge. Avoid leaning forward over your front thigh.",
+  "Knee past toes - step further": "Step a bit further forward. Your front knee should stay directly above your ankle at the bottom of the lunge.",
+  "Lower into the lunge": "Try lowering your hips closer to the ground to achieve a full 90-degree bend in both knees.",
+  "Too deep - ease up": "You are descending below a safe range of motion. Keep your front thigh parallel to the floor.",
+  "Lower your back knee": "Actively drop your rear knee down toward the floor to engage the glutes and core.",
+  
+  // Shoulder Abduction
+  "Keep Torso Straight": "Engage your core and stand solid. Avoid leaning your body sideways as you raise your arms.",
+  "Keep Arms Straight": "Try not to bend your elbows. Keep your arms fully extended to isolate the shoulder deltoid muscles.",
+  "Raise Both Arms Evenly": "One arm raised higher than the other. Focus on lifting them symmetrically at the same speed.",
+  "Raise Arms Higher": "Make sure to raise your arms all the way to shoulder height (90 degrees) to complete the motion."
+};
+
+// ── Sound Engine (Web Audio API) ──────────────────────────────
+class SoundEngine {
+  constructor() {
+    this.ctx = null;
+  }
+  init() {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  }
+  playSuccess() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const osc1 = this.ctx.createOscillator();
+    const osc2 = this.ctx.createOscillator();
+    const gainNode = this.ctx.createGain();
+    
+    osc1.connect(gainNode);
+    osc2.connect(gainNode);
+    gainNode.connect(this.ctx.destination);
+    
+    gainNode.gain.setValueAtTime(0, this.ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(vol * 0.12, this.ctx.currentTime + 0.05);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + 0.35);
+    
+    osc1.frequency.setValueAtTime(523.25, this.ctx.currentTime); // C5
+    osc1.frequency.exponentialRampToValueAtTime(659.25, this.ctx.currentTime + 0.08); // E5
+    osc2.frequency.setValueAtTime(783.99, this.ctx.currentTime); // G5
+    
+    osc1.start(this.ctx.currentTime);
+    osc2.start(this.ctx.currentTime);
+    osc1.stop(this.ctx.currentTime + 0.4);
+    osc2.stop(this.ctx.currentTime + 0.4);
+  }
+  playError() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const osc = this.ctx.createOscillator();
+    const gainNode = this.ctx.createGain();
+    
+    osc.type = 'sawtooth';
+    osc.connect(gainNode);
+    gainNode.connect(this.ctx.destination);
+    
+    gainNode.gain.setValueAtTime(0, this.ctx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(vol * 0.15, this.ctx.currentTime + 0.05);
+    gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 0.25);
+    
+    osc.frequency.setValueAtTime(120, this.ctx.currentTime);
+    osc.frequency.linearRampToValueAtTime(80, this.ctx.currentTime + 0.2);
+    
+    osc.start(this.ctx.currentTime);
+    osc.stop(this.ctx.currentTime + 0.3);
+  }
+  playTick() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const osc = this.ctx.createOscillator();
+    const gainNode = this.ctx.createGain();
+    osc.type = 'triangle';
+    osc.connect(gainNode);
+    gainNode.connect(this.ctx.destination);
+    
+    gainNode.gain.setValueAtTime(vol * 0.15, this.ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + 0.04);
+    
+    osc.frequency.setValueAtTime(900, this.ctx.currentTime);
+    
+    osc.start(this.ctx.currentTime);
+    osc.stop(this.ctx.currentTime + 0.05);
+  }
+  playRestPip() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const osc = this.ctx.createOscillator();
+    const gainNode = this.ctx.createGain();
+    osc.connect(gainNode);
+    gainNode.connect(this.ctx.destination);
+    
+    gainNode.gain.setValueAtTime(vol * 0.12, this.ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + 0.08);
+    
+    osc.frequency.setValueAtTime(1000, this.ctx.currentTime);
+    
+    osc.start(this.ctx.currentTime);
+    osc.stop(this.ctx.currentTime + 0.1);
+  }
+  playRestGo() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const osc = this.ctx.createOscillator();
+    const gainNode = this.ctx.createGain();
+    osc.connect(gainNode);
+    gainNode.connect(this.ctx.destination);
+    
+    gainNode.gain.setValueAtTime(vol * 0.2, this.ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + 0.25);
+    
+    osc.frequency.setValueAtTime(1320, this.ctx.currentTime);
+    
+    osc.start(this.ctx.currentTime);
+    osc.stop(this.ctx.currentTime + 0.3);
+  }
+  playSessionComplete() {
+    this.init();
+    const vol = parseFloat(settings.volume) / 100;
+    if (vol <= 0) return;
+    
+    const notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
+    notes.forEach((freq, idx) => {
+      const osc = this.ctx.createOscillator();
+      const gainNode = this.ctx.createGain();
+      
+      osc.connect(gainNode);
+      gainNode.connect(this.ctx.destination);
+      
+      const startTime = this.ctx.currentTime + idx * 0.12;
+      gainNode.gain.setValueAtTime(0, startTime);
+      gainNode.gain.linearRampToValueAtTime(vol * 0.12, startTime + 0.03);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.35);
+      
+      osc.frequency.setValueAtTime(freq, startTime);
+      
+      osc.start(startTime);
+      osc.stop(startTime + 0.45);
+    });
+  }
+}
+const sound = new SoundEngine();
+
+// ── Canvas Waveform Chart plotter ──────────────────────────────
+class WaveformChart {
+  constructor(canvasId) {
+    this.canvas = document.getElementById(canvasId);
+    if (!this.canvas) return;
+    this.ctx = this.canvas.getContext('2d');
+    this.points = [];
+    this.maxPoints = 80;
+    this.currentColor = 'green';
+    
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    this.draw();
+  }
+  resize() {
+    if (!this.canvas) return;
+    const rect = this.canvas.parentNode.getBoundingClientRect();
+    this.canvas.width = rect.width * (window.devicePixelRatio || 1);
+    this.canvas.height = rect.height * (window.devicePixelRatio || 1);
+    this.ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  }
+  push(val, color) {
+    if (val === null || val === undefined) return;
+    this.currentColor = color || 'green';
+    this.points.push(val);
+    if (this.points.length > this.maxPoints) {
+      this.points.shift();
+    }
+  }
+  clear() {
+    this.points = [];
+  }
+  draw() {
+    if (!this.canvas) return;
+    requestAnimationFrame(() => this.draw());
+    
+    const w = this.canvas.width / (window.devicePixelRatio || 1);
+    const h = this.canvas.height / (window.devicePixelRatio || 1);
+    
+    this.ctx.clearRect(0, 0, w, h);
+    
+    // Draw horizontal grid lines (0, 45, 90, 135, 180 degrees)
+    this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+    this.ctx.lineWidth = 1;
+    this.ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+    this.ctx.font = '8px "JetBrains Mono", monospace';
+    
+    const gridAngles = [0, 45, 90, 135, 180];
+    gridAngles.forEach(ang => {
+      const y = h - (ang / 180) * (h - 14) - 7;
+      this.ctx.beginPath();
+      this.ctx.moveTo(35, y);
+      this.ctx.lineTo(w, y);
+      this.ctx.stroke();
+      this.ctx.fillText(ang + '°', 6, y + 3);
+    });
+    
+    if (this.points.length < 2) return;
+    
+    // Choose color theme
+    let strokeColor = '#10b981'; // green
+    if (this.currentColor === 'orange') strokeColor = '#f97316';
+    else if (this.currentColor === 'red') strokeColor = '#ef4444';
+    
+    this.ctx.beginPath();
+    const startX = 35;
+    const step = (w - startX) / (this.maxPoints - 1);
+    const pad = this.maxPoints - this.points.length;
+    
+    const getCoords = (idx) => {
+      const val = this.points[idx];
+      const x = startX + (idx + pad) * step;
+      const y = h - (val / 180) * (h - 14) - 7;
+      return { x, y };
+    };
+    
+    let p0 = getCoords(0);
+    this.ctx.moveTo(p0.x, p0.y);
+    
+    for (let i = 0; i < this.points.length - 1; i++) {
+      const p1 = getCoords(i);
+      const p2 = getCoords(i + 1);
+      const xc = (p1.x + p2.x) / 2;
+      const yc = (p1.y + p2.y) / 2;
+      this.ctx.quadraticCurveTo(p1.x, p1.y, xc, yc);
+    }
+    
+    const lastP = getCoords(this.points.length - 1);
+    this.ctx.lineTo(lastP.x, lastP.y);
+    
+    // Stroke neon glowing path
+    this.ctx.shadowBlur = 6;
+    this.ctx.shadowColor = strokeColor;
+    this.ctx.strokeStyle = strokeColor;
+    this.ctx.lineWidth = 2.5;
+    this.ctx.stroke();
+    this.ctx.shadowBlur = 0;
+    
+    // Draw glowing node head
+    this.ctx.beginPath();
+    this.ctx.arc(lastP.x, lastP.y, 4, 0, 2 * Math.PI);
+    this.ctx.fillStyle = '#ffffff';
+    this.ctx.fill();
+    this.ctx.strokeStyle = strokeColor;
+    this.ctx.lineWidth = 1.5;
+    this.ctx.stroke();
+  }
+}
+let chart = null;
+
+// ── Confetti Celebration Particle Engine ────────────────────────
+class ConfettiEngine {
+  constructor(canvasId) {
+    this.canvas = document.getElementById(canvasId);
+    if (!this.canvas) return;
+    this.ctx = this.canvas.getContext('2d');
+    this.particles = [];
+    this.active = false;
+    
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+  }
+  resize() {
+    if (!this.canvas) return;
+    this.canvas.width = window.innerWidth;
+    this.canvas.height = window.innerHeight;
+  }
+  start() {
+    this.particles = [];
+    this.active = true;
+    this.resize();
+    
+    const colors = ['#6c63ff', '#00d9ff', '#10b981', '#f97316', '#ef4444', '#f59e0b'];
+    for (let i = 0; i < 150; i++) {
+      this.particles.push({
+        x: window.innerWidth / 2 + (Math.random() - 0.5) * 60,
+        y: window.innerHeight + 15,
+        vx: (Math.random() - 0.5) * 15,
+        vy: -Math.random() * 18 - 8,
+        r: Math.random() * 5 + 3,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        rot: Math.random() * 360,
+        rotSp: (Math.random() - 0.5) * 12
+      });
+    }
+    this.loop();
+  }
+  stop() {
+    this.active = false;
+    if (this.ctx && this.canvas) {
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+  }
+  loop() {
+    if (!this.active || !this.canvas) return;
+    requestAnimationFrame(() => this.loop());
+    
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    
+    this.ctx.clearRect(0, 0, w, h);
+    
+    let activeParticles = false;
+    this.particles.forEach(p => {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.45; // gravity
+      p.vx *= 0.985; // air drag
+      p.rot += p.rotSp;
+      
+      if (p.y < h + 20) {
+        activeParticles = true;
+        this.ctx.save();
+        this.ctx.translate(p.x, p.y);
+        this.ctx.rotate(p.rot * Math.PI / 180);
+        this.ctx.fillStyle = p.color;
+        this.ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r);
+        this.ctx.restore();
+      }
+    });
+    
+    if (!activeParticles) {
+      this.active = false;
+    }
+  }
+}
+const confetti = new ConfettiEngine('confetti-canvas');
+
+// ── Screen Helpers ─────────────────────────────────────────────
 function showScreen(name) {
-  Object.values(screens).forEach(s => { s.classList.remove('active'); s.style.display = 'none'; });
+  Object.values(screens).forEach(s => {
+    if (!s) return;
+    s.classList.remove('active');
+    s.style.display = 'none';
+  });
   const s = screens[name];
+  if (!s) return;
   s.style.display = 'flex';
   requestAnimationFrame(() => s.classList.add('active'));
+  
+  if (name === 'setup') {
+    confetti.stop();
+    updateHistoryUI();
+  }
 }
 
-// ── Setup screen ───────────────────────────────────────────────
+// ── Stepper Setup ──────────────────────────────────────────────
 let reps = 10, sets = 3;
 
-// ── Exercise preview data ──────────────────────────────────────
 const EXERCISE_PREVIEW = {
   SQUATS: {
     image: 'images/squats.png',
@@ -168,7 +547,7 @@ const getSets = makeStepper('sets-dec','sets-inc','sets-val', 1, 10, 3,  v => { 
 function voiceSpeak(text) {
   if (voiceEnabled && 'speechSynthesis' in window) {
     const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.15; // Slightly faster for quick fluid guidance
+    u.rate = 1.15;
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(u);
   }
@@ -204,7 +583,6 @@ async function toggleCamera(forceState) {
   
   if (targetState) {
     try {
-      // Ask user for browser camera permission with a timeout for headless environments
       const streamPromise = navigator.mediaDevices.getUserMedia({ video: true });
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error("Timeout")), 3000)
@@ -216,8 +594,6 @@ async function toggleCamera(forceState) {
       });
       
       if (browserStream) {
-        // Stop the browser stream track immediately to save resources,
-        // as backend OpenCV is doing the actual capturing.
         browserStream.getTracks().forEach(track => track.stop());
         browserStream = null;
       }
@@ -226,7 +602,6 @@ async function toggleCamera(forceState) {
       updateCameraUI(true);
       socket.emit('camera_toggle', { enabled: true });
       
-      // Reset UI elements if running
       if (sessionState === 'running') {
         if (videoPlaceholder) {
           videoPlaceholder.textContent = 'Initializing Camera...';
@@ -248,7 +623,6 @@ async function toggleCamera(forceState) {
     updateCameraUI(false);
     socket.emit('camera_toggle', { enabled: false });
     
-    // Hide active video feed and show off placeholder if running
     if (sessionState === 'running') {
       if (videoFeed) videoFeed.style.display = 'none';
       if (videoPlaceholder) {
@@ -280,16 +654,32 @@ $('btn-start').addEventListener('click', async () => {
   await startSession();
 });
 
+// ── Metronome Engine ───────────────────────────────────────────
+function startMetronome() {
+  stopMetronome();
+  if (!settings.metronome) return;
+  
+  metronomeIntervalId = setInterval(() => {
+    if (sessionState === 'running' && !restTimerId) {
+      sound.playTick();
+    }
+  }, 1600); // 1.6s beat pacing
+}
+
+function stopMetronome() {
+  if (metronomeIntervalId) {
+    clearInterval(metronomeIntervalId);
+    metronomeIntervalId = null;
+  }
+}
+
 // ── Session start ──────────────────────────────────────────────
 async function startSession() {
   if (!cameraEnabled) {
     const proceed = confirm('📷 Camera is currently OFF.\n\nWould you like to turn it ON and grant camera permissions to start tracking your movements?');
     if (proceed) {
       await toggleCamera(true);
-      if (!cameraEnabled) {
-        // User denied or failed to turn camera ON, abort session start
-        return;
-      }
+      if (!cameraEnabled) return;
     } else {
       return;
     }
@@ -297,17 +687,21 @@ async function startSession() {
 
   currentSet   = 1;
   lastRepCount = 0;
+  lastCorrectCount = 0;
+  lastIncorrectCount = 0;
   lastSetCompleteTime = 0;
   sessionState = 'running';
+  sessionErrors.clear();
 
-  // Cancel any in-progress rest timer from a previous set
   if (restTimerId) { clearInterval(restTimerId); restTimerId = null; }
   if (restOverlay) restOverlay.style.display = 'none';
 
-  // Reset video feed
+  // Apply camera mirror settings
   if (videoFeed) {
     videoFeed.style.display = 'none';
     videoFeed.src = '';
+    if (settings.mirror) videoFeed.classList.add('mirrored');
+    else videoFeed.classList.remove('mirrored');
   }
   if (videoPlaceholder) {
     videoPlaceholder.style.display = 'flex';
@@ -329,6 +723,9 @@ async function startSession() {
   updateRing(0, cfg.reps);
   updateAccRing(null);
 
+  // Clear chart
+  if (chart) chart.clear();
+
   // Tips
   const tipsList = $('tips-list');
   tipsList.innerHTML = '';
@@ -345,11 +742,14 @@ async function startSession() {
 
   showScreen('exercise');
   socket.emit('start', { mode: cfg.mode, reps: cfg.reps, sets: cfg.sets });
+  
+  sound.playRestGo();
+  if (settings.metronome) startMetronome();
 }
 
 // ── Stop ───────────────────────────────────────────────────────
 $('btn-stop').addEventListener('click', () => {
-  // Cancel rest timer if it is running
+  stopMetronome();
   if (restTimerId) { clearInterval(restTimerId); restTimerId = null; }
   if (restOverlay) restOverlay.style.display = 'none';
   socket.emit('stop');
@@ -372,6 +772,7 @@ socket.on('py_event', (data) => {
   }
 
   if (data.type === 'stopped' && sessionState === 'running') {
+    stopMetronome();
     sessionState = 'setup';
     showScreen('setup');
     return;
@@ -380,7 +781,6 @@ socket.on('py_event', (data) => {
   if (data.type === 'frame' && sessionState === 'running') {
     if (cameraEnabled && videoFeed) {
       videoFeed.src = 'data:image/jpeg;base64,' + data.data;
-      // Use computed style to correctly detect hidden state (CSS rule vs inline style)
       const computed = window.getComputedStyle(videoFeed);
       if (computed.display === 'none') {
         videoFeed.style.display = 'block';
@@ -410,6 +810,13 @@ socket.on('py_event', (data) => {
 
 // ── Status handler ─────────────────────────────────────────────
 function handleStatus(d) {
+  // Push raw angle to waveform graph
+  if (chart && d.angle !== undefined && d.angle !== null) {
+    chart.push(d.angle, d.color);
+    const liveValDisplay = $('live-angle-val');
+    if (liveValDisplay) liveValDisplay.textContent = d.angle + '°';
+  }
+
   // Rep counter
   const rep = d.rep ?? 0;
   const targetReps = d.target_reps ?? cfg.reps;
@@ -425,13 +832,32 @@ function handleStatus(d) {
   updateRing(rep, targetReps);
 
   // Correct / incorrect
-  correctCount.textContent   = d.correct   ?? 0;
-  incorrectCount.textContent = d.incorrect ?? 0;
+  const curCorr = d.correct ?? 0;
+  const curIncorr = d.incorrect ?? 0;
+  
+  if (curCorr > lastCorrectCount) {
+    sound.playSuccess();
+    lastCorrectCount = curCorr;
+  }
+  if (curIncorr > lastIncorrectCount) {
+    sound.playError();
+    lastIncorrectCount = curIncorr;
+  }
+  
+  correctCount.textContent   = curCorr;
+  incorrectCount.textContent = curIncorr;
+
+  // Track session errors for insights
+  if (d.color === 'red' || d.color === 'orange') {
+    if (d.feedback && d.feedback !== 'Keep going…') {
+      sessionErrors.add(d.feedback);
+    }
+  }
 
   // Accuracy
-  const total = (d.correct ?? 0) + (d.incorrect ?? 0);
+  const total = curCorr + curIncorr;
   if (total > 0) {
-    const acc = Math.round((d.correct / total) * 100);
+    const acc = Math.round((curCorr / total) * 100);
     accuracyPct.textContent = acc + '%';
     updateAccRing(acc);
     accFill.style.stroke = acc >= 70 ? 'var(--green)' : acc >= 40 ? 'var(--orange)' : 'var(--red)';
@@ -458,65 +884,76 @@ function handleStatus(d) {
   const fb  = d.feedback ?? '';
   const col = d.color    ?? 'green';
   setFeedback(fb || 'Keep going…', col, ICONS[col] ?? '🎯');
-
 }
 
 // ── Set / session complete handler ─────────────────────────────
 function handleSetComplete(d) {
-  // Debounce: ignore rapid duplicate events
   const now = Date.now();
   if (now - lastSetCompleteTime < 4000) return;
   lastSetCompleteTime = now;
 
+  stopMetronome();
+
   if (currentSet < cfg.sets) {
-    // Show rest timer with stats from the just-completed set
     showRestTimer(currentSet, d);
   } else {
-    // All sets done
     sessionState = 'complete';
     socket.emit('stop');
     voiceSpeak("Session complete! Excellent job, you have completed all your sets!");
+    
+    // Save to history logs
+    const sessionLog = {
+      date: new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+      mode: cfg.mode,
+      sets: cfg.sets,
+      reps: cfg.reps,
+      correct: d.correct ?? 0,
+      incorrect: d.incorrect ?? 0,
+      total: d.total ?? 0,
+      accuracy: d.total > 0 ? Math.round(((d.correct ?? 0) / d.total) * 100) : 0
+    };
+    let historyLogs = JSON.parse(localStorage.getItem('physioai_history')) || [];
+    historyLogs.unshift(sessionLog);
+    if (historyLogs.length > 20) historyLogs.pop();
+    localStorage.setItem('physioai_history', JSON.stringify(historyLogs));
+    
     showComplete(d);
   }
 }
 
 // ── Rest timer between sets ─────────────────────────────────────
 function showRestTimer(completedSet, d) {
-  // Populate previous-set stats inside the overlay
   const correct   = d.correct   ?? 0;
   const incorrect = d.incorrect ?? 0;
   const total     = correct + incorrect;
   const acc       = total > 0 ? Math.round((correct / total) * 100) : 0;
+  
   restPrevStats.innerHTML = `
     <div class="rps-item"><span class="rps-val" style="color:var(--green)">${correct}</span><span class="rps-lbl">Correct</span></div>
     <div class="rps-item"><span class="rps-val" style="color:var(--red)">${incorrect}</span><span class="rps-lbl">Errors</span></div>
     <div class="rps-item"><span class="rps-val" style="color:var(--accent2)">${acc}%</span><span class="rps-lbl">Accuracy</span></div>
   `;
 
-  // Show overlay
   restOverlay.style.display = 'flex';
   restOverlay.style.animation = 'none';
   restOverlay.offsetHeight;
   restOverlay.style.animation = '';
 
-  let remaining = REST_DURATION;
+  let duration = parseInt(settings.restDuration);
+  let remaining = duration;
   restCountdown.textContent    = remaining;
   restBarFill.style.transition = 'none';
   restBarFill.style.width      = '100%';
 
+  voiceSpeak(`Set ${completedSet} complete! Rest for ${duration} seconds.`);
 
-
-  voiceSpeak(`Set ${completedSet} complete! Rest for ${REST_DURATION} seconds.`);
-
-  // Kick off progress bar shrink
   requestAnimationFrame(() => {
-    restBarFill.style.transition = `width ${REST_DURATION}s linear`;
+    restBarFill.style.transition = `width ${duration}s linear`;
     restBarFill.style.width      = '0%';
   });
 
   if (restTimerId) clearInterval(restTimerId);
 
-  // Wire skip button
   const skipBtn = $('btn-skip-rest');
   const skipHandler = () => {
     if (restTimerId) { clearInterval(restTimerId); restTimerId = null; }
@@ -530,15 +967,14 @@ function showRestTimer(completedSet, d) {
     remaining--;
     restCountdown.textContent = remaining;
 
-    // Pulse on tick
-    restCountdown.style.transform = 'scale(1.18)';
+    restCountdown.style.transform = 'scale(1.15)';
     setTimeout(() => { restCountdown.style.transform = 'scale(1)'; }, 120);
 
     if (remaining === 10) voiceSpeak('10 seconds remaining. Get ready!');
-    if (remaining === 5)  voiceSpeak('5 seconds. Get ready!');
-    if (remaining === 3)  voiceSpeak('3');
-    if (remaining === 2)  voiceSpeak('2');
-    if (remaining === 1)  voiceSpeak('1');
+    if (remaining === 5)  voiceSpeak('5 seconds!');
+    if (remaining === 3)  { voiceSpeak('3'); sound.playRestPip(); }
+    if (remaining === 2)  { voiceSpeak('2'); sound.playRestPip(); }
+    if (remaining === 1)  { voiceSpeak('1'); sound.playRestPip(); }
 
     if (remaining <= 0) {
       clearInterval(restTimerId);
@@ -555,8 +991,13 @@ function advanceToNextSet() {
   buildSetDots(cfg.sets, currentSet);
   setCounter.textContent = currentSet;
   lastRepCount = 0;
+  lastCorrectCount = 0;
+  lastIncorrectCount = 0;
   socket.emit('next_set', { set: currentSet, reps: cfg.reps });
   setFeedback(`Set ${currentSet} — Go!`, 'green', '🚀');
+  
+  sound.playRestGo();
+  if (settings.metronome) startMetronome();
 }
 
 // ── Complete screen ────────────────────────────────────────────
@@ -574,7 +1015,26 @@ function showComplete(d) {
     <div class="cstat"><div class="cstat-val" style="color:var(--orange)">${incorrect}</div><div class="cstat-lbl">Needs Work</div></div>
     <div class="cstat" style="grid-column:span 3"><div class="cstat-val" style="color:var(--accent)">${acc}%</div><div class="cstat-lbl">${grade}</div></div>
   `;
+  
+  // Render coaching insights
+  const insightsText = $('insights-text');
+  if (insightsText) {
+    if (sessionErrors.size > 0) {
+      // Pick up to two distinct errors to report
+      const errorList = Array.from(sessionErrors);
+      const tips = errorList.slice(0, 2).map(err => {
+        const text = INSIGHTS_MAP[err] || `Check your posture on warnings ("${err}").`;
+        return `• <strong>${err}:</strong> ${text}`;
+      }).join('<br><br>');
+      insightsText.innerHTML = tips;
+    } else {
+      insightsText.innerHTML = "🌟 <strong>Perfect Form!</strong> You completed all repetitions with exceptional range of motion, symmetry, and posture. Fantastic job!";
+    }
+  }
+
   showScreen('complete');
+  sound.playSessionComplete();
+  confetti.start();
 }
 
 $('btn-again').addEventListener('click', () => startSession());
@@ -590,7 +1050,7 @@ function setFeedback(text, color, icon) {
 function flashRep(label) {
   repFlash.textContent = label;
   repFlash.style.animation = 'none';
-  repFlash.offsetHeight; // reflow
+  repFlash.offsetHeight;
   repFlash.style.animation = 'flash .7s ease forwards';
 }
 
@@ -624,14 +1084,165 @@ function resetPhase() {
 function updatePhase(state) {
   resetPhase();
   if (state.includes('down') || state.includes('sitting') || state.includes('flexion')) {
-    $('ph-down').classList.add('active');
+    const downItem = $('ph-down');
+    if (downItem) downItem.classList.add('active');
   } else if (state.includes('up') || state.includes('extension') || state.includes('stand')) {
-    $('ph-up').classList.add('active');
+    const upItem = $('ph-up');
+    if (upItem) upItem.classList.add('active');
   }
 }
 
 function modeLabel(m) {
   return { SQUATS:'Squats', STS:'Sit to Stand', LUNGES:'Lunges', SHOULDER_ABD:'Shoulder Abduction' }[m] || m;
+}
+
+// ── Personal history UI binding ───────────────────────────────
+function updateHistoryUI() {
+  const historyLogs = JSON.parse(localStorage.getItem('physioai_history')) || [];
+  
+  const totalWorkoutsVal = $('stats-total-workouts');
+  const avgAccuracyVal = $('stats-avg-accuracy');
+  const streakVal = $('stats-streak');
+  const historyList = $('history-list');
+  
+  if (totalWorkoutsVal) totalWorkoutsVal.textContent = historyLogs.length;
+  
+  if (avgAccuracyVal) {
+    let sumAcc = 0;
+    historyLogs.forEach(h => sumAcc += h.accuracy);
+    avgAccuracyVal.textContent = historyLogs.length > 0 ? Math.round(sumAcc / historyLogs.length) + '%' : '—';
+  }
+  
+  if (streakVal) {
+    const uniqueDays = new Set(historyLogs.map(h => h.date.split(',')[0]));
+    streakVal.textContent = uniqueDays.size;
+  }
+  
+  if (historyList) {
+    historyList.innerHTML = '';
+    if (historyLogs.length === 0) {
+      historyList.innerHTML = '<li class="history-empty">No workouts completed yet. Your logs will appear here!</li>';
+      return;
+    }
+    
+    historyLogs.forEach(h => {
+      const li = document.createElement('li');
+      li.className = 'history-item';
+      
+      const accClass = h.accuracy >= 80 ? 'acc-good' : h.accuracy >= 50 ? 'acc-mid' : 'acc-poor';
+      const labelStr = modeLabel(h.mode);
+      
+      li.innerHTML = `
+        <div class="history-item-left">
+          <span class="history-item-name">${labelStr}</span>
+          <span class="history-item-date">${h.date}</span>
+        </div>
+        <div class="history-item-right">
+          <span class="history-badge">${h.sets}s × ${h.reps}r</span>
+          <span class="history-badge ${accClass}">${h.accuracy}% Acc</span>
+        </div>
+      `;
+      historyList.appendChild(li);
+    });
+  }
+}
+
+const clearHistoryBtn = $('btn-clear-history');
+if (clearHistoryBtn) {
+  clearHistoryBtn.addEventListener('click', () => {
+    if (confirm('⚠️ Clear History?\n\nAre you sure you want to permanently delete your training logs?')) {
+      localStorage.removeItem('physioai_history');
+      updateHistoryUI();
+    }
+  });
+}
+
+// ── Settings modal event bindings ─────────────────────────────
+const settingsToggleBtn = $('btn-settings-toggle');
+const settingsCloseBtn = $('btn-settings-close');
+const settingsModal = $('settings-modal');
+
+if (settingsToggleBtn && settingsModal) {
+  settingsToggleBtn.addEventListener('click', () => {
+    settingsModal.style.display = 'flex';
+    sound.init(); // Initialize context on user click
+  });
+}
+if (settingsCloseBtn && settingsModal) {
+  settingsCloseBtn.addEventListener('click', () => {
+    settingsModal.style.display = 'none';
+  });
+}
+
+// Sliders and toggles logic
+const restDurInput = $('setting-rest-duration');
+const restDurVal = $('val-rest-duration');
+const volumeInput = $('setting-volume');
+const volumeVal = $('val-volume');
+const metronomeBtn = $('setting-metronome');
+const mirrorBtn = $('setting-mirror');
+
+// Initialize settings fields in DOM
+if (restDurInput && restDurVal) {
+  restDurInput.value = settings.restDuration;
+  restDurVal.textContent = settings.restDuration + 's';
+  
+  restDurInput.addEventListener('input', (e) => {
+    settings.restDuration = e.target.value;
+    restDurVal.textContent = e.target.value + 's';
+    localStorage.setItem('physioai_settings', JSON.stringify(settings));
+  });
+}
+
+if (volumeInput && volumeVal) {
+  volumeInput.value = settings.volume;
+  volumeVal.textContent = settings.volume + '%';
+  
+  volumeInput.addEventListener('input', (e) => {
+    settings.volume = e.target.value;
+    volumeVal.textContent = e.target.value + '%';
+    localStorage.setItem('physioai_settings', JSON.stringify(settings));
+  });
+  
+  // Play quick click sound on release to test volume
+  volumeInput.addEventListener('change', () => {
+    sound.playTick();
+  });
+}
+
+if (metronomeBtn) {
+  metronomeBtn.className = 'btn-toggle ' + (settings.metronome ? 'toggle-on' : 'toggle-off');
+  metronomeBtn.addEventListener('click', () => {
+    settings.metronome = !settings.metronome;
+    metronomeBtn.className = 'btn-toggle ' + (settings.metronome ? 'toggle-on' : 'toggle-off');
+    localStorage.setItem('physioai_settings', JSON.stringify(settings));
+    sound.playTick();
+  });
+}
+
+if (mirrorBtn) {
+  mirrorBtn.className = 'btn-toggle ' + (settings.mirror ? 'toggle-on' : 'toggle-off');
+  mirrorBtn.addEventListener('click', () => {
+    settings.mirror = !settings.mirror;
+    mirrorBtn.className = 'btn-toggle ' + (settings.mirror ? 'toggle-on' : 'toggle-off');
+    localStorage.setItem('physioai_settings', JSON.stringify(settings));
+    sound.playTick();
+    
+    // Apply immediately to videoFeed if active
+    if (videoFeed) {
+      if (settings.mirror) videoFeed.classList.add('mirrored');
+      else videoFeed.classList.remove('mirrored');
+    }
+  });
+}
+
+// Close modal when clicking outside the card
+if (settingsModal) {
+  settingsModal.addEventListener('click', (e) => {
+    if (e.target === settingsModal) {
+      settingsModal.style.display = 'none';
+    }
+  });
 }
 
 // ── Inject SVG gradient for ring ──────────────────────────────
@@ -645,7 +1256,7 @@ function modeLabel(m) {
     </linearGradient>
   </defs>`;
   document.body.appendChild(svg);
-  ringFill.setAttribute('stroke','url(#ringGrad)');
+  if (ringFill) ringFill.setAttribute('stroke','url(#ringGrad)');
 })();
 
 // Socket connection camera state synchronization
@@ -669,4 +1280,9 @@ if (exVoiceToggle) exVoiceToggle.addEventListener('click', () => toggleVoice());
 
 updateCameraUI(cameraEnabled);
 updateVoiceUI(voiceEnabled);
+
+// Create real-time chart instance
+chart = new WaveformChart('waveform-canvas');
+
+// Show setup screen & render history
 showScreen('setup');

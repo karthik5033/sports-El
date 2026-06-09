@@ -345,6 +345,7 @@ while True:
     
     feedback = ""
     color = (0, 255, 0)
+    current_angle = None
     
     if detection_result.pose_landmarks:
         for pose_landmarks in detection_result.pose_landmarks:
@@ -379,6 +380,7 @@ while True:
                     l_knee_angle = calculate_angle(l_h_c, l_k_c, l_a_c)
                     r_knee_angle = calculate_angle(r_h_c, r_k_c, r_a_c)
                     avg_knee_angle = (l_knee_angle + r_knee_angle) / 2
+                    current_angle = avg_knee_angle
                     
                     l_hip_angle = calculate_angle(l_s_c, l_h_c, l_k_c)
                     r_hip_angle = calculate_angle(r_s_c, r_h_c, r_k_c)
@@ -469,6 +471,7 @@ while True:
                     v_c = (h_c[0], h_c[1] - 100)
                     
                     knee_angle = calculate_angle(h_c, k_c, a_c)
+                    current_angle = knee_angle
                     hip_angle = calculate_angle(s_c, h_c, k_c)
                     back_angle = 90 - calculate_angle(v_c, h_c, s_c)
                     
@@ -542,6 +545,7 @@ while True:
                     b_a_c = (b_a.x * w, b_a.y * h)
                     
                     front_knee_angle = calculate_angle(f_h_c, f_k_c, f_a_c)
+                    current_angle = front_knee_angle
                     back_knee_angle = calculate_angle(b_h_c, b_k_c, b_a_c)
                     vertical_down = (f_h_c[0], f_h_c[1] + 100)
                     trunk_angle = calculate_angle(vertical_down, f_h_c, f_s_c)
@@ -627,6 +631,7 @@ while True:
                         l_sh = sum(abd_history["l_sh"]) / len(abd_history["l_sh"])
                         r_sh = sum(abd_history["r_sh"]) / len(abd_history["r_sh"])
                         avg_sh = (l_sh + r_sh) / 2
+                        current_angle = avg_sh
                         
                         l_el = sum(abd_history["l_el"]) / len(abd_history["l_el"])
                         r_el = sum(abd_history["r_el"]) / len(abd_history["r_el"])
@@ -726,7 +731,8 @@ while True:
         "color":        "green" if color == (0,255,0) else ("orange" if color == (0,165,255) else "red"),
         "set":          current_set,
         "total_sets":   total_sets,
-        "completed":    session.completed
+        "completed":    session.completed,
+        "angle":        round(current_angle) if current_angle is not None else None
     })
 
     # Encode frame as JPEG and emit to UI
